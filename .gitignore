@@ -1,0 +1,18 @@
+chrom_data
+tongyi_api_key.txt
+api_keys.local.json
+*.local.json
+.env
+.env.*
+
+# crawler outputs
+today_xueqiu.json
+report.txt
+xueqiu_output/
+
+# playwright chrome persistent profile (may contain cookies/login state)
+pw_chrome_profile/
+
+# python cache
+__pycache__/
+*.pyc
