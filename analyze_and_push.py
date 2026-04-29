@@ -1,7 +1,12 @@
 import json
 import os
 import sys
+import smtplib
+import argparse
 from datetime import datetime
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+from email.header import Header
 from openai import OpenAI
 
 # 尽量确保 Windows 控制台输出为 UTF-8，避免中文乱码/编码异常
@@ -36,6 +41,102 @@ def load_tongyi_api_key(keys_path="api_keys.local.json"):
         raise RuntimeError(f"未在 {keys_path} 中找到 tongyi.api_key")
     return api_key.strip()
 
+def load_email_config(keys_path="api_keys.local.json"):
+    """
+    从 api_keys.local.json 读取邮件配置。
+    约定结构：
+    {
+      "email": {
+        "enabled": true,
+        "smtp_host": "smtp.qq.com",
+        "smtp_port": 465,
+        "use_ssl": true,
+        "username": "xxx@qq.com",
+        "password": "邮箱SMTP授权码",
+        "from_addr": "xxx@qq.com",
+        "to_addrs": ["you@example.com"]
+      }
+    }
+    """
+    keys = load_json_data(keys_path) or {}
+    email_cfg = keys.get("email") or {}
+    if not isinstance(email_cfg, dict):
+        return {}
+    return email_cfg
+
+def send_report_email(report_content, report_path, email_cfg):
+    if not report_content:
+        print("[WARN] 报告为空，跳过邮件发送。")
+        return False
+
+    enabled = bool(email_cfg.get("enabled", False))
+    if not enabled:
+        print("[INFO] 邮件发送未启用（email.enabled=false），已跳过。")
+        return False
+
+    smtp_host = email_cfg.get("smtp_host")
+    smtp_port = int(email_cfg.get("smtp_port", 465))
+    use_ssl = bool(email_cfg.get("use_ssl", True))
+    username = email_cfg.get("username")
+    password = email_cfg.get("password")
+    from_addr = email_cfg.get("from_addr") or username
+    to_addrs = email_cfg.get("to_addrs") or []
+
+    if isinstance(to_addrs, str):
+        to_addrs = [to_addrs]
+
+    # QQ/163 等常要求用户名为完整邮箱地址；若配置成昵称则回退到 from_addr
+    if isinstance(username, str) and "@" not in username and isinstance(from_addr, str) and "@" in from_addr:
+        print("[WARN] email.username 不是邮箱地址，自动回退使用 from_addr 登录。")
+        username = from_addr
+
+    required = [smtp_host, username, password, from_addr]
+    if not all(required) or not to_addrs:
+        print("[WARN] 邮件配置不完整，跳过邮件发送。")
+        return False
+
+    today = datetime.now().strftime("%Y-%m-%d")
+    subject = f"{today}_repo"
+
+    msg = MIMEMultipart()
+    msg["From"] = from_addr
+    msg["To"] = ",".join(to_addrs)
+    msg["Subject"] = Header(subject, "utf-8")
+
+    body = f"自动日报已生成。\n\n文件：{report_path}\n\n以下为正文：\n\n{report_content}"
+    msg.attach(MIMEText(body, "plain", "utf-8"))
+
+    attempts = [(use_ssl, smtp_port)]
+    # 连接被中断时自动尝试另一种常见 SMTP 模式
+    if use_ssl:
+        attempts.append((False, 587))
+    else:
+        attempts.append((True, 465))
+
+    last_err = None
+    for idx, (ssl_mode, port) in enumerate(attempts, start=1):
+        try:
+            if ssl_mode:
+                with smtplib.SMTP_SSL(smtp_host, port, timeout=30) as server:
+                    server.login(username, password)
+                    server.sendmail(from_addr, to_addrs, msg.as_string())
+            else:
+                with smtplib.SMTP(smtp_host, port, timeout=30) as server:
+                    server.ehlo()
+                    server.starttls()
+                    server.ehlo()
+                    server.login(username, password)
+                    server.sendmail(from_addr, to_addrs, msg.as_string())
+
+            print(f"[OK] 邮件发送成功：{','.join(to_addrs)} (ssl={ssl_mode}, port={port})")
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"[WARN] 第 {idx} 次发送失败 (ssl={ssl_mode}, port={port})：{e}")
+
+    print(f"[ERROR] 邮件发送失败：{last_err}")
+    return False
+
 def _today_tag(dt=None):
     dt = dt or datetime.now()
     return dt.strftime("%b_%dth").lower()
@@ -51,6 +152,7 @@ def load_today_market_inputs(output_root="output_info", today_tag=None):
         ],
         "news": [
             os.path.join(output_root, tag, "news.json"),
+            os.path.join(output_root, tag, "news_data.json"),  # market_data_fetcher.py 输出
             os.path.join(output_root, tag, "today_news.json"),
             os.path.join(output_root, "news", f"{tag}_news.json"),
         ],
@@ -262,20 +364,45 @@ def analyze_market_data():
         
         report = response.choices[0].message.content
         
-        # 保存报告到本地
-        with open('report.txt', 'w', encoding='utf-8') as f:
+        # 保存报告到 daily_report/日期_repo.txt
+        os.makedirs("daily_report", exist_ok=True)
+        report_file = f"{datetime.now().strftime('%Y-%m-%d')}_repo.txt"
+        report_path = os.path.join("daily_report", report_file)
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)
-        print("\nAI 深度研判完成，已保存为 report.txt。")
-        return report
+        print(f"\nAI 深度研判完成，已保存为 {report_path}。")
+        return report, report_path
 
     except Exception as e:
         print(f"[ERROR] 调用通义千问 API 时发生错误：{e}")
-        return None
+        return None, None
 
 if __name__ == "__main__":
+    parser = argparse.ArgumentParser(description="通义三维共振分析与日报发送")
+    parser.add_argument(
+        "--email-test",
+        action="store_true",
+        help="仅测试邮件发送，不调用千问分析",
+    )
+    args = parser.parse_args()
+
     print("="*50)
     print("启动通义千问【三维共振】深度推演系统")
     print("="*50)
-    
+
+    email_cfg = load_email_config()
+
+    if args.email_test:
+        test_content = (
+            "这是一封测试邮件，用于验证 SMTP 配置是否可用。\n"
+            f"发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        )
+        ok = send_report_email(test_content, "N/A(TEST)", email_cfg)
+        raise SystemExit(0 if ok else 1)
+
     # 1. 思考与分析
-    analyze_market_data()
+    final_report, report_path = analyze_market_data()
+
+    # 2. 可选：自动发邮件
+    if final_report and report_path:
+        send_report_email(final_report, report_path, email_cfg)
