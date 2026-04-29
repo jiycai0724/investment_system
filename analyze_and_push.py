@@ -1,12 +1,8 @@
 import json
 import os
 import sys
-import smtplib
-import argparse
+import re
 from datetime import datetime
-from email.mime.text import MIMEText
-from email.mime.multipart import MIMEMultipart
-from email.header import Header
 from openai import OpenAI
 
 # 尽量确保 Windows 控制台输出为 UTF-8，避免中文乱码/编码异常
@@ -21,6 +17,52 @@ except Exception:
 # qwen-max 是综合能力最强的旗舰模型；如果想体验纯粹的深度思考模型，可换成 qwq-32b-preview
 MODEL_NAME = "qwen-max" 
 # =========================================
+
+def extract_focus_stocks_json(report_text):
+    """
+    从模型报告中提取最后一个 ```json ... ``` 代码块并解析为 dict。
+    """
+    if not isinstance(report_text, str) or not report_text.strip():
+        return None
+
+    matches = re.findall(r"```json\s*(\{[\s\S]*?\})\s*```", report_text, flags=re.IGNORECASE)
+    if not matches:
+        return None
+
+    last_json_block = matches[-1]
+    try:
+        data = json.loads(last_json_block)
+    except json.JSONDecodeError:
+        return None
+
+    if not isinstance(data, dict):
+        return None
+    if "focus_stocks" not in data:
+        return None
+    stocks = data.get("focus_stocks")
+    if not isinstance(stocks, list):
+        return None
+    # 兼容旧格式（纯名称）与新格式（名称(代码)），过滤非字符串项
+    data["focus_stocks"] = [s for s in stocks if isinstance(s, str)]
+    return data
+
+def save_focus_stocks_json(report_text, output_dir="daily_report"):
+    """
+    将报告末尾 focus_stocks JSON 单独保存为：
+    daily_report/YYYY-MM-DD_focus_stocks.json
+    """
+    focus_data = extract_focus_stocks_json(report_text)
+    if not focus_data:
+        print("[WARN] 未在报告中找到合法的 focus_stocks JSON，跳过单独保存。")
+        return None
+
+    os.makedirs(output_dir, exist_ok=True)
+    file_name = f"{datetime.now().strftime('%Y-%m-%d')}_focus_stocks.json"
+    file_path = os.path.join(output_dir, file_name)
+    with open(file_path, "w", encoding="utf-8") as f:
+        json.dump(focus_data, f, ensure_ascii=False, indent=2)
+    print(f"[OK] 已保存 focus_stocks JSON：{file_path}")
+    return file_path
 
 def load_json_data(file_path):
     """辅助函数：安全读取 JSON 文件"""
@@ -40,102 +82,6 @@ def load_tongyi_api_key(keys_path="api_keys.local.json"):
     if not api_key or not isinstance(api_key, str):
         raise RuntimeError(f"未在 {keys_path} 中找到 tongyi.api_key")
     return api_key.strip()
-
-def load_email_config(keys_path="api_keys.local.json"):
-    """
-    从 api_keys.local.json 读取邮件配置。
-    约定结构：
-    {
-      "email": {
-        "enabled": true,
-        "smtp_host": "smtp.qq.com",
-        "smtp_port": 465,
-        "use_ssl": true,
-        "username": "xxx@qq.com",
-        "password": "邮箱SMTP授权码",
-        "from_addr": "xxx@qq.com",
-        "to_addrs": ["you@example.com"]
-      }
-    }
-    """
-    keys = load_json_data(keys_path) or {}
-    email_cfg = keys.get("email") or {}
-    if not isinstance(email_cfg, dict):
-        return {}
-    return email_cfg
-
-def send_report_email(report_content, report_path, email_cfg):
-    if not report_content:
-        print("[WARN] 报告为空，跳过邮件发送。")
-        return False
-
-    enabled = bool(email_cfg.get("enabled", False))
-    if not enabled:
-        print("[INFO] 邮件发送未启用（email.enabled=false），已跳过。")
-        return False
-
-    smtp_host = email_cfg.get("smtp_host")
-    smtp_port = int(email_cfg.get("smtp_port", 465))
-    use_ssl = bool(email_cfg.get("use_ssl", True))
-    username = email_cfg.get("username")
-    password = email_cfg.get("password")
-    from_addr = email_cfg.get("from_addr") or username
-    to_addrs = email_cfg.get("to_addrs") or []
-
-    if isinstance(to_addrs, str):
-        to_addrs = [to_addrs]
-
-    # QQ/163 等常要求用户名为完整邮箱地址；若配置成昵称则回退到 from_addr
-    if isinstance(username, str) and "@" not in username and isinstance(from_addr, str) and "@" in from_addr:
-        print("[WARN] email.username 不是邮箱地址，自动回退使用 from_addr 登录。")
-        username = from_addr
-
-    required = [smtp_host, username, password, from_addr]
-    if not all(required) or not to_addrs:
-        print("[WARN] 邮件配置不完整，跳过邮件发送。")
-        return False
-
-    today = datetime.now().strftime("%Y-%m-%d")
-    subject = f"{today}_repo"
-
-    msg = MIMEMultipart()
-    msg["From"] = from_addr
-    msg["To"] = ",".join(to_addrs)
-    msg["Subject"] = Header(subject, "utf-8")
-
-    body = f"自动日报已生成。\n\n文件：{report_path}\n\n以下为正文：\n\n{report_content}"
-    msg.attach(MIMEText(body, "plain", "utf-8"))
-
-    attempts = [(use_ssl, smtp_port)]
-    # 连接被中断时自动尝试另一种常见 SMTP 模式
-    if use_ssl:
-        attempts.append((False, 587))
-    else:
-        attempts.append((True, 465))
-
-    last_err = None
-    for idx, (ssl_mode, port) in enumerate(attempts, start=1):
-        try:
-            if ssl_mode:
-                with smtplib.SMTP_SSL(smtp_host, port, timeout=30) as server:
-                    server.login(username, password)
-                    server.sendmail(from_addr, to_addrs, msg.as_string())
-            else:
-                with smtplib.SMTP(smtp_host, port, timeout=30) as server:
-                    server.ehlo()
-                    server.starttls()
-                    server.ehlo()
-                    server.login(username, password)
-                    server.sendmail(from_addr, to_addrs, msg.as_string())
-
-            print(f"[OK] 邮件发送成功：{','.join(to_addrs)} (ssl={ssl_mode}, port={port})")
-            return True
-        except Exception as e:
-            last_err = e
-            print(f"[WARN] 第 {idx} 次发送失败 (ssl={ssl_mode}, port={port})：{e}")
-
-    print(f"[ERROR] 邮件发送失败：{last_err}")
-    return False
 
 def _today_tag(dt=None):
     dt = dt or datetime.now()
@@ -339,16 +285,25 @@ def analyze_market_data():
     (思考逻辑：哪些板块同时满足“出政策利好 + 大V热烈讨论 + 主力资金真实大额流入”？)
     请列出今日确定性最高的 5 个主线板块，并详细说明它的催化剂是什么，资金介入程度如何。
 
-    模块二：【致命背离（杀猪盘与踏空预警）】
+    模块三：【致命背离（杀猪盘与踏空预警）】
     (思考逻辑：寻找数据之间的矛盾点！)
     - 危险信号：有没有大V在疯狂吹捧、新闻猛发利好，但资金面（主力流向）却在悄悄大幅净流出的板块？(警惕诱多出货)
     - 潜伏信号：有没有新闻完全没提、大V都在看空或无视，但机构龙虎榜或主力资金却在偷偷大额买入的标的？(底部分歧建仓)
 
-    模块三：🎯 【核心标的资金拆解】
+    模块四：【核心标的资金拆解】
     请提取大V们讨论的具体股票名称，并去【资金面】数据中查验：这些股票今天的主力资金到底是净流入还是净流出？如果有龙虎榜机构席位，请重点标出。给出“真金白银验证后”的重点关注个股名单。
 
-    模块四：📈 【明日操盘剧本】
+    模块五：【明日操盘剧本】
     用三句简短锐利的话，提炼明早竞价和开盘阶段最需要观察的阵眼（变量）以及整体仓位建议。
+    
+    【极其重要的格式要求】：
+    在撰写完上述所有文本内容后，请在回答的最后，**务必附加一个合法的 JSON 代码块**，把你今天报告中重点看好或提及的 A 股具体股票提取出来（不超过 10 只），每条格式为"股票名称(股票代码)"。
+    格式必须完全如下：
+    ```json
+    {
+      "focus_stocks": ["贵州茅台(600519)", "宁德时代(300750)", "中芯国际(688981)"]
+    }
+    ```
     """
 
     try:
@@ -371,6 +326,7 @@ def analyze_market_data():
         with open(report_path, 'w', encoding='utf-8') as f:
             f.write(report)
         print(f"\nAI 深度研判完成，已保存为 {report_path}。")
+        save_focus_stocks_json(report)
         return report, report_path
 
     except Exception as e:
@@ -378,31 +334,8 @@ def analyze_market_data():
         return None, None
 
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="通义三维共振分析与日报发送")
-    parser.add_argument(
-        "--email-test",
-        action="store_true",
-        help="仅测试邮件发送，不调用千问分析",
-    )
-    args = parser.parse_args()
-
     print("="*50)
     print("启动通义千问【三维共振】深度推演系统")
     print("="*50)
 
-    email_cfg = load_email_config()
-
-    if args.email_test:
-        test_content = (
-            "这是一封测试邮件，用于验证 SMTP 配置是否可用。\n"
-            f"发送时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        )
-        ok = send_report_email(test_content, "N/A(TEST)", email_cfg)
-        raise SystemExit(0 if ok else 1)
-
-    # 1. 思考与分析
-    final_report, report_path = analyze_market_data()
-
-    # 2. 可选：自动发邮件
-    if final_report and report_path:
-        send_report_email(final_report, report_path, email_cfg)
+    analyze_market_data()
